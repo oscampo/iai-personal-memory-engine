@@ -673,6 +673,52 @@ def _per_turn_recall_hook_paths() -> tuple:
     return src, dst
 
 
+def _hook_shell_command(script: Path) -> str:
+    """Build the settings.json hook command string for one script.
+
+    On Windows, Claude Code CLI resolves the bare token "bash" to bash.exe's
+    absolute path itself and persists that back into settings.json --
+    unquoted. Git for Windows installs to "C:\\Program Files\\Git\\..." by
+    default, and the unquoted rewrite breaks every hook with
+    "C:\\Program: command not found" (confirmed live on Windows 11,
+    Claude Code CLI v2.1.234: every hook failed with that exact error until
+    the command was rewritten pre-quoted). iai-mcp cannot fix how Claude
+    Code CLI resolves "bash"; resolving and quoting the path here, so the
+    string we write is already safe, sidesteps it.
+    """
+    import shutil as _shutil
+
+    if os.name == "nt":
+        bash_path = _shutil.which("bash") or "bash"
+        return f'"{bash_path}" "{script}"'
+    return f"bash {script}"
+
+
+def _upsert_hook_entry(
+    hook_list: list, marker: str, command: str, timeout: int, matcher: "str | None" = None,
+) -> str:
+    """Ensure exactly one hook entry with `marker` in its command exists,
+    with the given command/timeout. Self-heals in place if the marker is
+    already present but the command differs — e.g. a stale unquoted
+    bash.exe path from before _hook_shell_command existed — rather than
+    treating marker presence alone as "already correctly wired". Returns
+    a short status string for the install log.
+    """
+    for entry in hook_list:
+        for h in entry.get("hooks") or []:
+            if marker in (h.get("command") or ""):
+                if h.get("command") == command and h.get("timeout") == timeout:
+                    return "already wired — no change"
+                h["command"] = command
+                h["timeout"] = timeout
+                return "command updated (was stale)"
+    new_entry = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+    if matcher is not None:
+        new_entry["matcher"] = matcher
+    hook_list.append(new_entry)
+    return "registered"
+
+
 def _load_settings(path):
     import json as _json
     if not path.exists():
@@ -761,30 +807,14 @@ def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
     stop_list = data["hooks"].setdefault("Stop", [])
     submit_list = data["hooks"].setdefault("UserPromptSubmit", [])
 
-    hook_cmd = f"bash {dst}"
-    turn_cmd = f"bash {turn_dst}"
+    hook_cmd = _hook_shell_command(dst)
+    turn_cmd = _hook_shell_command(turn_dst)
 
-    already_stop = any(
-        any(_CAPTURE_HOOK_MARKER in (h.get("command") or "")
-            for h in (entry.get("hooks") or []))
-        for entry in stop_list
-    )
-    if already_stop:
-        print(f"settings.json already has Stop hook — no change")
-    else:
-        stop_list.append({"hooks": [{"type": "command", "command": hook_cmd, "timeout": 35}]})
-        print(f"patched: {settings} (Stop hook registered)")
+    stop_status = _upsert_hook_entry(stop_list, _CAPTURE_HOOK_MARKER, hook_cmd, 35)
+    print(f"settings.json Stop hook: {stop_status}")
 
-    already_turn = any(
-        any(_TURN_HOOK_MARKER in (h.get("command") or "")
-            for h in (entry.get("hooks") or []))
-        for entry in submit_list
-    )
-    if already_turn:
-        print(f"settings.json already has UserPromptSubmit hook — no change")
-    else:
-        submit_list.append({"hooks": [{"type": "command", "command": turn_cmd, "timeout": 5}]})
-        print(f"patched: {settings} (UserPromptSubmit hook registered)")
+    turn_status = _upsert_hook_entry(submit_list, _TURN_HOOK_MARKER, turn_cmd, 5)
+    print(f"settings.json UserPromptSubmit hook: {turn_status}")
 
     pt_src, pt_dst = _per_turn_recall_hook_paths()
     if pt_src.exists():
@@ -793,19 +823,9 @@ def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
         pt_dst.chmod(pt_dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
         print(f"installed: {pt_dst}")
 
-        pt_cmd = f"bash {pt_dst}"
-        already_pt = any(
-            any(_PER_TURN_RECALL_HOOK_MARKER in (h.get("command") or "")
-                for h in (entry.get("hooks") or []))
-            for entry in submit_list
-        )
-        if already_pt:
-            print("settings.json already has per-turn recall hook — no change")
-        else:
-            submit_list.append(
-                {"hooks": [{"type": "command", "command": pt_cmd, "timeout": 5}]}
-            )
-            print(f"patched: {settings} (per-turn recall hook registered)")
+        pt_cmd = _hook_shell_command(pt_dst)
+        pt_status = _upsert_hook_entry(submit_list, _PER_TURN_RECALL_HOOK_MARKER, pt_cmd, 5)
+        print(f"settings.json per-turn recall hook: {pt_status}")
     else:
         print(f"WARN: per-turn recall hook template missing in package data: {pt_src}")
 
@@ -817,20 +837,12 @@ def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
         print(f"installed: {dst_recall}")
 
         ss_list = data["hooks"].setdefault("SessionStart", [])
-        recall_cmd = f"bash {dst_recall}"
-        already_recall = any(
-            any(_SESSION_RECALL_HOOK_MARKER in (h.get("command") or "")
-                for h in (entry.get("hooks") or []))
-            for entry in ss_list
+        recall_cmd = _hook_shell_command(dst_recall)
+        recall_status = _upsert_hook_entry(
+            ss_list, _SESSION_RECALL_HOOK_MARKER, recall_cmd, 30,
+            matcher="startup|resume|clear|compact",
         )
-        if already_recall:
-            print("settings.json already has SessionStart hook — no change")
-        else:
-            ss_list.append({
-                "matcher": "startup|resume|clear|compact",
-                "hooks": [{"type": "command", "command": recall_cmd, "timeout": 30}],
-            })
-            print(f"patched: {settings} (SessionStart hook registered)")
+        print(f"settings.json SessionStart hook: {recall_status}")
     else:
         print(f"WARN: recall hook template missing in package data: {src_recall}")
 
